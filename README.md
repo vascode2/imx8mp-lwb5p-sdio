@@ -174,7 +174,7 @@ at boot.
 ## 8. Kernel Config: cfg80211 / mac80211 / Bluetooth
 
 The Summit **backports** provide their own cfg80211 / mac80211 / Bluetooth modules.
-Its `checks.h` refuses to build when these are present **in the kernel**:
+Its `checks.h` only refuses to build when these are **built into** the kernel as `=y`:
 
 ```c
 #if defined(CONFIG_CFG80211) && defined(CPTCFG_CFG80211_MODULE)
@@ -182,8 +182,21 @@ Its `checks.h` refuses to build when these are present **in the kernel**:
 #endif
 ```
 
-> `CONFIG_CFG80211=m` does **not** help — `defined(CONFIG_CFG80211)` is true even for a
-> module, so the `#error` still fires. The kernel must have these **completely absent**.
+> `CONFIG_CFG80211=m` is **fine** — with a module the kernel defines `CONFIG_CFG80211_MODULE`,
+> **not** `CONFIG_CFG80211`, so `defined(CONFIG_CFG80211)` is false and the `#error` does
+> **not** fire. The `#error` only trips when the symbol is built-in (`=y`).
+
+### Recommended kernel config (radio bring-up doc)
+The working alignment of `imx_v8_defconfig`:
+
+| Option | Setting | Reason |
+|--------|---------|--------|
+| `CONFIG_CFG80211`  | `=m` (module) | backports WLAN needs `net_device.ieee80211_ptr` present; `=m` avoids the `checks.h` `#error` |
+| `CONFIG_MAC80211`  | off (`is not set`) | Summit backports provides its own |
+| `CONFIG_WLAN`      | off (`is not set`) | no in-tree wireless LAN drivers |
+| `CONFIG_BT`        | off (`is not set`) | Summit backports provides its own BT stack (`lwb` defconfig) |
+| `CONFIG_FW_LOADER_USER_HELPER_FALLBACK` | off | no sysfs firmware fallback |
+| `CONFIG_IMX_SDMA`  | `=m` | DMA for the BT UART path |
 
 ### Pitfall — why a normal config fragment doesn't work
 `linux-imx` runs `do_copy_defconfig` **after** `do_kernel_configme`, which **overwrites
@@ -191,14 +204,15 @@ Its `checks.h` refuses to build when these are present **in the kernel**:
 Also, `DELTA_KERNEL_DEFCONFIG`'s `merge_config.sh` **cannot turn `=y` off** — it only
 appends duplicate `# … is not set` lines, which are ignored by kconfig.
 
-**Therefore the disables must be written into `imx_v8_defconfig` itself**
+**Therefore the settings must be written into `imx_v8_defconfig` itself**
 (via the `do_patch:append` in §7.1), so `do_copy_defconfig` copies them in.
 
-### Consequence of disabling cfg80211
-`struct net_device.ieee80211_ptr` in the kernel is guarded by
-`#if IS_ENABLED(CONFIG_CFG80211)`. Disabling cfg80211 **compiles that member out** —
-which the backports' own cfg80211 code requires. This is the core tension (see
-§11 “Open Issues”).
+> Do **not** set `CONFIG_CFG80211 is not set`. That compiles `net_device.ieee80211_ptr`
+> out of the kernel (`#if IS_ENABLED(CONFIG_CFG80211)`), which the backports' own
+> cfg80211 code requires — the WLAN backports then fail to build (`nl80211.c`:
+> `struct net_device has no member 'ieee80211_ptr'`) and the whole backports recipe
+> aborts, so **no Bluetooth modules get packaged either**. `CONFIG_CFG80211=m` is the
+> correct setting.
 
 ---
 
@@ -249,13 +263,15 @@ e.g. `BCM4373A0-sdio*…hcd`.
 
 ## 11. Open Issues / Notes
 
-- **Compiler API mismatch (kernel 6.12 vs backports 14.8.0.6).**
-  Summit backports 14.8.0.6 cfg80211 references `net_device.ieee80211_ptr`, which
-  kernel 6.12 compiles out when cfg80211 is disabled. The backports must have cfg80211
-  *absent* (for `checks.h`) but *present* (for the struct member) — a fundamental
-  conflict on this kernel. The `lrd-14.8.0.x` branch still pins 14.8.0.6 and does not
-  fix it. **Needed:** a backports build validated on 6.12 (check with Ezurio), an older
-  kernel BSP, or a backports compat patch.
+- ~~Compiler API mismatch (kernel 6.12 vs backports 14.8.0.6).~~
+  **Resolved.** Earlier builds set `CONFIG_CFG80211 is not set`, which compiled
+  `net_device.ieee80211_ptr` out of kernel 6.12 and broke the backports WLAN build
+  (`nl80211.c: no member 'ieee80211_ptr'`), aborting the whole recipe before the
+  Bluetooth modules could be packaged. The fix is to set **`CONFIG_CFG80211=m`**
+  (a module keeps the member in the kernel and does not trip `checks.h`), leaving
+  `MAC80211`/`BT`/`WLAN` off so Summit's backports provide them. With that, both
+  `brcmfmac`/`cfg80211` (wlan0) and `hci_uart`/`btbcm`/`bluetooth` (hci0) build
+  successfully on kernel 6.12.34.
 
 - **EEPROM/reg files** are installed via the firmware packages
   (`regLWB5plus-aarch64` etc.) and picked up at runtime.
