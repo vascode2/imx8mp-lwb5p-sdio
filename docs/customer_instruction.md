@@ -9,7 +9,7 @@ i.MX8MP EVK with an Ezurio/Summit **Sterling LWB5+** (`CYW4373A0`) module, using
 > public Ezurio layer (`https://github.com/Ezurio/meta-summit-radio`, branch
 > `lrd-14.8.0.x`) and adds the LWB5+ integration files by hand. Everything needed
 > to reproduce the build is contained in this document. For deeper rationale per
-> step, see [`detailed_instruction.md`](detailed_instruction.md).
+> step, see [`customer_instruction_detailed.md`](customer_instruction_detailed.md).
 
 ## Hardware & Scope
 

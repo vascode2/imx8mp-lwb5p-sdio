@@ -10,7 +10,7 @@ boot-partition fix. No manual file editing is needed.
 
 > For a fork-free version (official Ezurio layer + manual integration files), see
 > [`docs/customer_instruction.md`](docs/customer_instruction.md) or the deeper
-> [`docs/detailed_instruction.md`](docs/detailed_instruction.md).
+> [`docs/customer_instruction_detailed.md`](docs/customer_instruction_detailed.md).
 
 ## Architecture
 
