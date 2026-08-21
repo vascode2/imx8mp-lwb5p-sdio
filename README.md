@@ -1,104 +1,105 @@
-# Sterling LWB5+ (SDIO/UART M.2) Integration on NXP i.MX8M Plus EVK — Yocto Bring-up Guide
+# Sterling LWB5+ (SDIO/UART M.2) on NXP i.MX8M Plus EVK — Build Guide
 
-Application note for bringing up **WiFi (WLAN) over SDIO** and **Bluetooth over UART**
-on the NXP **i.MX8M Plus EVK** using an **Ezurio/Summit Sterling LWB5+ (BCM4373/CYW4373A0)**
-module fitted in the M.2 slot — built with **Yocto/Poky**.
+This guide takes you from **nothing** to a bootable Yocto image for the NXP
+**i.MX8M Plus EVK** that brings up:
 
-This is an update to the Ezurio application note
-[“Sterling LWB5+ USB Dongle – NXP i.MX8M EVK Integration Guide”][appnote-usb],
-but for the **M.2 SDIO/UART** module variant instead of the USB dongle.
+- **WiFi (`wlan0`)** over **SDIO** — Ezurio/Summit Sterling **LWB5+** (`CYW4373A0`) in the M.2 slot
+- **Bluetooth (`hci0`)** over **UART** (`uart1`)
 
----
+Everything is a copy-paste block. Run each block top-to-bottom in the order shown.
 
-## 1. Scope & Hardware
-
-| Item | Value |
-|------|-------|
-| SoC / Board | NXP **i.MX8M Plus** EVK (`imx8mpevk`) |
-| Radio | Ezurio/Summit **Sterling LWB5+**, **CYW4373A0 (BCM4373)** chipset |
-| Form factor | **M.2** module in the EVK's M.2 SDIO-capable slot |
-| WLAN interface | **SDIO** (`usdhc1`, mmc@30b40000) |
-| Bluetooth interface | **UART** (`uart1`) |
-
-> The M.2 slot on the i.MX8MP EVK can route **SDIO** (not just PCIe). NXP ships a
-> dedicated device tree for this: `imx8mp-evk-usdhc1-m2.dts`.
-
-## 2. Software Stack
-
-| Component | Version |
-|-----------|---------|
-| Yocto / Poky | 5.2 ("walnascar", DISTRO_VERSION 5.2.2) |
-| DISTRO | `fsl-imx-wayland` |
-| Machine | `imx8mpevk` |
-| Kernel | `linux-imx` 6.12.34 (NXP BSP) |
-| U-Boot | `u-boot-imx` 2025.04 |
-| Summit Connectivity Stack | **LRD-REL-14.8.0.6** (`RADIO_VERSION = "14.8.0.6"`) |
-
-Summit layer used: `meta-summit-radio`.
+> **Bottom line:** we use **Ezurio/Summit's own wireless & Bluetooth stack** (the
+> `meta-summit-radio` backports), not the mainline kernel drivers. That is why we
+> disable the kernel's built-in wireless/BT and set `CONFIG_CFG80211=m` (a module,
+> not built-in — see §8).
 
 ---
 
-## 3. Reference Documents
+## Prerequisites
 
-- Ezurio USB-dongle app note (original): [Sterling LWB5+ USB Dongle – i.MX8M EVK][appnote-usb]
-- Ezurio `meta-summit-radio` (branch `lrd-14.8.0.x`): <https://github.com/Ezurio/meta-summit-radio>
-- NXP i.MX8M Plus EVK device tree sources (in `linux-imx`):
-  - `arch/arm64/boot/dts/freescale/imx8mp-evk.dts`
-  - `arch/arm64/boot/dts/freescale/imx8mp-evk-usdhc1-m2.dts` (SDIO/PCIe M.2 slot)
+- A 64-bit Linux build machine (this was validated on Ubuntu 24.04), ~150 GB free disk.
+- The **i.MX8MP EVK** with an **M.2 SDIO-capable slot** (the `M.2` connector, not PCIe-only).
+- The **Sterling LWB5+** module installed in that M.2 slot.
+- A serial console to the EVK and an SD card to boot the image.
 
 ---
 
-## 4. Architecture Overview
+## Part A — One-time machine setup
 
-```
-                    i.MX8M Plus EVK
-  ┌───────────────────────────────────────────────┐
-  │                                               │
-  │  M.2 slot  ── SDIO ──► usdhc1 (mmc@30b40000) │  WLAN (wlan0)
-  │      └────── UART ──► uart1                   │  BT (hci0)
-  │                                               │
-  │  SD card   ── SDIO ──► usdhc2 (mmc@30b50000) │  boot device (mmcblk1)
-  │  eMMC      ── SDIO ──► usdhc3 (mmc@30b60000) │  non-removable
-  │                                               │
-  └───────────────────────────────────────────────┘
+```bash
+# Install host packages for Yocto (Ubuntu/Debian)
+sudo apt update
+sudo apt install -y gawk wget git diffstat unzip texinfo gcc build-essential chrpath \
+    socat cpio python3 python3-pip python3-venv python3-pexpect xz-utils debianutils \
+    iputils-ping python3-git python3-jinja2 python3-subunit zstd liblz4-tool file \
+    libssl-dev libgmp-dev libmpc-dev bison flex meson ninja-build pkg-config \
+    bmap-tools mtools dosfstools
+
+# 'repo' tool (Google)
+mkdir -p ~/bin
+curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+chmod a+rx ~/bin/repo
+export PATH=~/bin:$PATH
 ```
 
-Stock `imx8mp-evk.dts` prints:
-- `usdhc1` (M.2 SDIO slot): **disabled**, no wireless child node
-- `uart1`: enabled for BT, but with `compatible = "nxp,88w8997-bt"` (the *wrong* chip —
-  NXP/Marvell 88W8997, not Broadcom CYW4373A0)
-
-Both are fixed by a **custom device tree** (see §6).
+> The `export PATH` only lasts for that shell. Add it to `~/.bashrc` if you want it permanent:
+> `echo 'export PATH=~/bin:$PATH' >> ~/.bashrc`
 
 ---
 
-## 5. Why the Radio Did Not Appear Out of the Box
+## Part B — Fetch the BSP sources (repo manifest)
 
-When first booting the stock image with `fdtfile=imx8mp-evk.dtb`:
+```bash
+# Pick a workspace directory
+mkdir -p ~/yocto && cd ~/yocto
 
-- `iw dev` → empty (**no wlan0**)
-- `hciconfig -a` → empty (**no hci0**)
-- `lsusb` → only Linux root hubs (USB path not used for M.2)
+# Initialize with the NXP i.MX BSP manifest we validated against.
+# This creates a 'sources/' tree with poky + NXP/meta layers.
+repo init -u https://github.com/nxp-imx/imx-manifest \
+          -b imx-6.12.49-2.2.0 \
+          -m imx-6.12.49-2.2.0.xml
+repo sync -j$(nproc)
+```
 
-**Root causes (both device-tree, not firmware):**
-
-1. **WLAN** – The M.2 SDIO slot (`usdhc1`) is `status = "disabled"` in the stock dtb, so
-   the mmc/SDIO interface for the radio is never brought up.
-2. **Bluetooth** – `uart1` is declared for BT but with the `nxp,88w8997-bt` compatible
-   string. The Broadcom `hci_uart`/`btbcm` driver cannot bind to it, so no `hci0`.
-
-The image already contained the correct **SDIO firmware** (`lwb5plus-sdio-div-firmware`)
-and the Summit **backports** wifi/bt drivers — they just had no matching DT node.
+> If `repo` complains about missing platform tools, run `sudo apt install -y git-core` and retry.
 
 ---
 
-## 6. Custom Device Tree
+## Part C — Add the Ezurio/Summit radio layer
 
-Create a device tree that **includes** NXP's SDIO M.2 config and **fixes** the BT node.
+`meta-summit-radio` supplies the **Summit backports** (kernel modules), **firmware**,
+**supplicant/networkmanager/hostapd**, and our **custom image recipe**.
 
-`recipes-kernel/linux/files/dts/imx8mp-evk-lwb5plus.dts`:
+```bash
+# Clone the Summit radio layer (branch lrd-14.8.0.x = stack version 14.8.0.6)
+cd ~/yocto/sources
+git clone -b lrd-14.8.0.x \
+    https://github.com/Ezurio/meta-summit-radio.git
+cd ~/yocto
+```
 
-```dts
+> The case of the directory name matters when we refer to it in `bblayers.conf`
+> (`meta-summit-radio/meta-summit-radio`).
+
+---
+
+## Part D — Create the build directory and add the files
+
+```bash
+# Create & configure the build directory for imx8mpevk / fsl-imx-wayland.
+# This runs imx-setup-release.sh which generates build-imx8mpevk-wal-lwbp/.
+DISTRO=fsl-imx-wayland MACHINE=imx8mpevk source ./imx-setup-release.sh \
+    -b build-imx8mpevk-wal-lwbp
+cd ~/yocto
+```
+
+Now create the four files below. **Use the exact contents shown.**
+
+### D.1 — Custom device tree (`sources/meta-summit-radio/meta-summit-radio/recipes-kernel/linux/files/dts/imx8mp-evk-lwb5plus.dts`)
+
+```bash
+mkdir -p sources/meta-summit-radio/meta-summit-radio/recipes-kernel/linux/files/dts
+cat > sources/meta-summit-radio/meta-summit-radio/recipes-kernel/linux/files/dts/imx8mp-evk-lwb5plus.dts <<'EOF'
 /dts-v1/;
 #include "imx8mp-evk-usdhc1-m2.dts"
 
@@ -108,73 +109,228 @@ Create a device tree that **includes** NXP's SDIO M.2 config and **fixes** the B
         compatible = "cypress,cyw4373a0-bt";
     };
 };
+EOF
 ```
 
-- `imx8mp-evk-usdhc1-m2.dts` (from NXP) does the heavy lifting for WLAN:
-  - enables `usdhc1` for SDIO
-  - adds `reg_usdhc1_vmmc` (WLAN_EN, GPIO2_IO06) and `usdhc1_pwrseq` (reset GPIO2_IO10)
-  - adds `wifi_wake_host`, `mmc-pwrseq-simple`
-  - disables `reg_pcie0`, `pcie`, `pcie_phy` (SDIO vs PCIe mux)
-- `cypress,cyw4373a0-bt` is the exact compatible string the Summit backported
-  `hci_bcm.c` binds to for the LWB5+ (with `.no_uart_clock_set = true`).
+> **Why:** the stock `imx8mp-evk.dts` keeps the M.2 SDIO slot (`usdhc1`) **disabled** and
+> declares BT on `uart1` with the **wrong** chip (`nxp,88w8997-bt`). Including NXP's
+> `imx8mp-evk-usdhc1-m2.dts` enables SDIO (WLAN) and swaps the BT compatible string so the
+> Broadcom `hci_uart`/`btbcm` driver binds.
 
-This single dtb enables **both WiFi (SDIO) and Bluetooth (UART)**.
+### D.2 — Kernel bbappend (`sources/meta-summit-radio/meta-summit-radio/recipes-kernel/linux/linux-imx_%.bbappend`)
 
----
-
-## 7. Yocto Layer Changes (meta-summit-radio)
-
-### 7.1 Kernel bbappend
-`recipes-kernel/linux/linux-imx_%.bbappend`
-
-```bitbake
+```bash
+cat > sources/meta-summit-radio/meta-summit-radio/recipes-kernel/linux/linux-imx_%.bbappend <<'EOF'
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 
+# Custom LWB5+ device trees to install into the kernel source
 LWB_DTS_FILES = "dts/imx8mp-evk-lwb5plus.dts"
 SRC_URI += "file://dts/imx8mp-evk-lwb5plus.dts"
-
 KERNEL_DEVICETREE:append:imx8mpevk = " freescale/imx8mp-evk-lwb5plus.dtb"
 
+# Summit/Ezurio backports (kernel-module-lwb-if-backports) ship their own
+# cfg80211, mac80211 and Bluetooth modules. checks.h only #errors when a symbol
+# is BUILT-IN (=y). A module (=m) keeps net_device.ieee80211_ptr in the kernel
+# (guarded by IS_ENABLED(CONFIG_CFG80211)) so the backports' own cfg80211 compiles,
+# and sets CONFIG_*_MODULE (not CONFIG_*) so checks.h is satisfied.
+#
+# linux-imx bakes imx_v8_defconfig in via do_copy_defconfig (which overwrites
+# configme fragments), and merge_config.sh can't turn =y symbols to 'not set'.
+# So patch imx_v8_defconfig itself here.
 do_patch:append() {
-    # 1) install custom dts
     if [ -d "${S}/arch/arm64/boot/dts/freescale" ]; then
-        install -m 0644 "${UNPACKDIR}/dts/imx8mp-evk-lwb5plus.dts" \
-            "${S}/arch/arm64/boot/dts/freescale/"
+        for i in ${LWB_DTS_FILES}; do
+            if [ -f "${UNPACKDIR}/${i}" ]; then
+                bbnote "Installing LWB5+ device tree ${i}"
+                install -m 0644 "${UNPACKDIR}/${i}" "${S}/arch/arm64/boot/dts/freescale/"
+            fi
+        done
     fi
-    # 2) disable in-kernel cfg80211/mac80211/BT in the defconfig (see §8)
     DEF="${S}/arch/arm64/configs/imx_v8_defconfig"
     if [ -f "$DEF" ]; then
+        bbnote "LWB5+: aligning imx_v8_defconfig with backports guidance"
         sed -i \
-            -e '/^CONFIG_CFG80211=y$/c\# CONFIG_CFG80211 is not set' \
-            -e '/^CONFIG_MAC80211=y$/c\# CONFIG_MAC80211 is not set' \
+            -e '/^CONFIG_CFG80211=y$/d' \
+            -e '/^CONFIG_CFG80211=m$/d' \
+            -e '/^# CONFIG_CFG80211 is not set$/d' \
+            -e '/^CONFIG_MAC80211=y$/d' \
+            -e '/^CONFIG_CFG80211_WEXT=y$/d' \
+            -e '/^CONFIG_CFG80211_REQUIRE_SIGNED_REGDB=y$/d' \
+            -e '/^CONFIG_CFG80211_USE_KERNEL_REGDB_KEYS=y$/d' \
+            -e '/^CONFIG_CFG80211_DEFAULT_PS=y$/d' \
+            -e '/^CONFIG_CFG80211_CRDA_SUPPORT=y$/d' \
+            -e '/^CONFIG_MAC80211_LEDS=y$/d' \
+            -e '/^CONFIG_MAC80211_HAS_RC=y$/d' \
+            -e '/^CONFIG_MAC80211_RC_MINSTREL=y$/d' \
+            -e '/^CONFIG_MAC80211_RC_DEFAULT_MINSTREL=y$/d' \
+            -e '/^CONFIG_MAC80211_RC_DEFAULT=/d' \
+            -e '/^CONFIG_WLAN=y$/d' \
+            -e '/^CONFIG_BT=y$/d' \
+            -e '/^CONFIG_BT=m$/d' \
+            -e '/^CONFIG_FW_LOADER_USER_HELPER_FALLBACK=y$/d' \
+            -e '/^CONFIG_IMX_SDMA=y$/c\CONFIG_IMX_SDMA=m' \
             "$DEF"
-        grep -q '^# CONFIG_BT is not set$' "$DEF" \
-            || printf '# CONFIG_BT is not set\n' >> "$DEF"
+        # Force symbols to our desired state (last match wins in kconfig)
+        printf 'CONFIG_CFG80211=m\n' >> "$DEF"
+        printf '# CONFIG_MAC80211 is not set\n' >> "$DEF"
+        printf '# CONFIG_WLAN is not set\n' >> "$DEF"
+        printf '# CONFIG_BT is not set\n' >> "$DEF"
+        printf '# CONFIG_FW_LOADER_USER_HELPER_FALLBACK is not set\n' >> "$DEF"
     fi
 }
+EOF
 ```
 
-### 7.2 U-Boot bbappend
-`recipes-bsp/u-boot/u-boot-imx_%.bbappend`
-```bitbake
+### D.3 — U-Boot bbappend + config (boot the custom dtb by default)
+
+```bash
+mkdir -p sources/meta-summit-radio/meta-summit-radio/recipes-bsp/u-boot/files
+cat > sources/meta-summit-radio/meta-summit-radio/recipes-bsp/u-boot/u-boot-imx_%.bbappend <<'EOF'
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 SRC_URI += "file://imx8mpevk-lwb5plus.cfg"
-```
+EOF
 
-`recipes-bsp/u-boot/files/imx8mpevk-lwb5plus.cfg`:
-```
+cat > sources/meta-summit-radio/meta-summit-radio/recipes-bsp/u-boot/files/imx8mpevk-lwb5plus.cfg <<'EOF'
 CONFIG_DEFAULT_FDT_FILE="imx8mp-evk-lwb5plus.dtb"
+EOF
 ```
 
-This makes U-Boot load the custom dtb **by default** so no manual `setenv` is needed
-at boot.
+> **Why:** makes U-Boot load the custom dtb (`imx8mp-evk-lwb5plus.dtb`) by default, so no
+> manual `setenv fdtfile ...` is needed at boot.
+
+### D.4 — Custom image recipe (`sources/meta-summit-radio/meta-summit-radio/recipes-packages/images/lwb5p-lrd14.bb`)
+
+```bash
+mkdir -p sources/meta-summit-radio/meta-summit-radio/recipes-packages/images
+cat > sources/meta-summit-radio/meta-summit-radio/recipes-packages/images/lwb5p-lrd14.bb <<'EOF'
+DESCRIPTION = "Sterling LWB5+ SDIO/UART M.2 sample image"
+LICENSE = "MIT"
+inherit core-image
+export IMAGE_BASENAME = "${PN}"
+
+IMAGE_FEATURES += "ssh-server-dropbear splash"
+IMAGE_FEATURES:remove = "tools-profile tools-debug tools-testapps"
+
+IMAGE_INSTALL += "\
+    iproute2 \
+    rng-tools \
+    ca-certificates \
+    tzdata \
+    htop \
+    ethtool \
+    iperf3 \
+    tcpdump \
+    iw \
+    kernel-module-lwb-if-backports \
+    lwb5plus-sdio-div-firmware \
+    summit-supplicant \
+    summit-networkmanager \
+    summit-networkmanager-nmcli \
+    libedit \
+    "
+EOF
+```
 
 ---
 
-## 8. Kernel Config: cfg80211 / mac80211 / Bluetooth
+## Part E — Configure the build directory
 
-The Summit **backports** provide their own cfg80211 / mac80211 / Bluetooth modules.
-Its `checks.h` only refuses to build when these are **built into** the kernel as `=y`:
+Add the Summit layer and our distro/machine preferences.
+
+```bash
+cd ~/yocto
+# Append the Summit layer to bblayers.conf
+tee -a build-imx8mpevk-wal-lwbp/conf/bblayers.conf <<'EOF'
+BBLAYERS += "${BSPDIR}/sources/meta-summit-radio/meta-summit-radio"
+EOF
+```
+
+Ensure `build-imx8mpevk-wal-lwbp/conf/local.conf` contains at least:
+
+```bash
+cat >> build-imx8mpevk-wal-lwbp/conf/local.conf <<'EOF'
+
+# Use Summit's supplicant/hostapd/networkmanager, not mainline
+PREFERRED_PROVIDER_wpa-supplicant = "summit-supplicant"
+PREFERRED_PROVIDER_wpa-supplicant-cli = "summit-supplicant-cli"
+PREFERRED_PROVIDER_wpa-supplicant-passphrase = "summit-supplicant-passphrase"
+PREFERRED_PROVIDER_hostapd = "summit-hostapd"
+PREFERRED_PROVIDER_networkmanager = "summit-networkmanager"
+PREFERRED_PROVIDER_networkmanager-cli = "summit-networkmanager-cli"
+PREFERRED_RPROVIDER_wireless-regdb-static = "wireless-regdb"
+LWB_REGDOMAIN = "US"
+EOF
+```
+
+> `LWB_REGDOMAIN` sets the regulatory domain (change to your region, e.g. `EU`).
+
+---
+
+## Part F — Build the image
+
+```bash
+cd ~/yocto
+# Re-enter the build environment
+source sources/base/setup-environment build-imx8mpevk-wal-lwbp
+
+# Build the LWB5+ image (this includes kernel + backports + firmware)
+bitbake lwb5p-lrd14
+```
+
+Output image (on success):
+
+```
+build-imx8mpevk-wal-lwbp/tmp/deploy/images/imx8mpevk/lwb5p-lrd14-imx8mpevk.rootfs.wic.gz
+```
+
+> First build takes a long time (hours). Rebuilds after that are incremental.
+
+---
+
+## Part G — Flash the SD card
+
+Insert an SD card into the build machine and find its device (e.g. `/dev/sdX` — **verify
+this carefully**, it will be overwritten).
+
+```bash
+# Replace /dev/sdX with YOUR card device. DANGER: data on it will be destroyed.
+sudo zstdcat \
+    build-imx8mpevk-wal-lwbp/tmp/deploy/images/imx8mpevk/lwb5p-lrd14-imx8mpevk.rootfs.wic.gz \
+    | sudo dd of=/dev/sdX bs=1M conv=fsync status=progress
+sync
+```
+
+Boot the EVK from the SD card and connect a serial console.
+
+---
+
+## Part H — Verify WiFi + Bluetooth on the EVK
+
+```bash
+# WiFi (SDIO)
+iw dev                 # expect: phy0 / wlan0
+ip link set wlan0 up
+iw dev wlan0 scan | head
+
+# Bluetooth (UART)
+hciconfig -a           # expect: hci0 UP RUNNING
+bluetoothctl           # interactive pairing / scan
+
+# Kernel log — expect Broadcom HCI binding + LWB5+ HCD firmware load
+dmesg | grep -iE 'brcm|hci_uart|hci0'
+```
+
+Working kernel log shows something like `BCM4373A0-sdio*…hcd` being loaded and an
+`hci0` device.
+
+---
+
+## Reference
+
+### §8 — Why `CONFIG_CFG80211=m` (not built-in, not "not set")
+
+The Summit backports build **their own** cfg80211 / mac80211 / Bluetooth modules.
+`checks.h` refuses only when a symbol is **built into** the kernel (`=y`):
 
 ```c
 #if defined(CONFIG_CFG80211) && defined(CPTCFG_CFG80211_MODULE)
@@ -182,116 +338,65 @@ Its `checks.h` only refuses to build when these are **built into** the kernel as
 #endif
 ```
 
-> `CONFIG_CFG80211=m` is **fine** — with a module the kernel defines `CONFIG_CFG80211_MODULE`,
-> **not** `CONFIG_CFG80211`, so `defined(CONFIG_CFG80211)` is false and the `#error` does
-> **not** fire. The `#error` only trips when the symbol is built-in (`=y`).
+- `=y` → `CONFIG_CFG80211` is defined → **`#error` fires.** Not allowed.
+- `=m` → only `CONFIG_CFG80211_MODULE` is defined → **no `#error`,** and
+  `net_device.ieee80211_ptr` stays in the kernel (guarded by `IS_ENABLED(CONFIG_CFG80211)`).
+- `is not set` → the `ieee80211_ptr` member **compiles out** → the backports WLAN fails to
+  build (`nl80211.c: no member 'ieee80211_ptr'`), aborting the whole recipe before the
+  Bluetooth modules are even packaged (so **no `hci0`**).
 
-### Recommended kernel config (radio bring-up doc)
-The working alignment of `imx_v8_defconfig`:
+Resulting kernel config:
 
 | Option | Setting | Reason |
 |--------|---------|--------|
-| `CONFIG_CFG80211`  | `=m` (module) | backports WLAN needs `net_device.ieee80211_ptr` present; `=m` avoids the `checks.h` `#error` |
-| `CONFIG_MAC80211`  | off (`is not set`) | Summit backports provides its own |
-| `CONFIG_WLAN`      | off (`is not set`) | no in-tree wireless LAN drivers |
-| `CONFIG_BT`        | off (`is not set`) | Summit backports provides its own BT stack (`lwb` defconfig) |
+| `CONFIG_CFG80211` | `=m` | backports WLAN + keeps `ieee80211_ptr`; avoids `checks.h` |
+| `CONFIG_MAC80211` | off | Summit backports provides it |
+| `CONFIG_WLAN` | off | no in-tree wireless LAN drivers |
+| `CONFIG_BT` | off | Summit backports provides its own BT stack (`lwb` defconfig) |
 | `CONFIG_FW_LOADER_USER_HELPER_FALLBACK` | off | no sysfs firmware fallback |
-| `CONFIG_IMX_SDMA`  | `=m` | DMA for the BT UART path |
+| `CONFIG_IMX_SDMA` | `=m` | DMA for the BT UART path |
 
-### Pitfall — why a normal config fragment doesn't work
-`linux-imx` runs `do_copy_defconfig` **after** `do_kernel_configme`, which **overwrites
-`.config`** with the stock `imx_v8_defconfig`, wiping any fragment applied by configme.
-Also, `DELTA_KERNEL_DEFCONFIG`'s `merge_config.sh` **cannot turn `=y` off** — it only
-appends duplicate `# … is not set` lines, which are ignored by kconfig.
+> Because `linux-imx` copies the defconfig in via `do_copy_defconfig` (overwriting
+> `configme` fragments), these settings must be written **into `imx_v8_defconfig` itself**
+> in `do_patch:append` (Part D.2) — a normal config fragment would be discarded.
 
-**Therefore the settings must be written into `imx_v8_defconfig` itself**
-(via the `do_patch:append` in §7.1), so `do_copy_defconfig` copies them in.
-
-> Do **not** set `CONFIG_CFG80211 is not set`. That compiles `net_device.ieee80211_ptr`
-> out of the kernel (`#if IS_ENABLED(CONFIG_CFG80211)`), which the backports' own
-> cfg80211 code requires — the WLAN backports then fail to build (`nl80211.c`:
-> `struct net_device has no member 'ieee80211_ptr'`) and the whole backports recipe
-> aborts, so **no Bluetooth modules get packaged either**. `CONFIG_CFG80211=m` is the
-> correct setting.
-
----
-
-## 9. Build Commands
-
-```bash
-cd <project-root>
-# machine/distro are baked in via conf/local.conf / bblayers.conf
-bitbake lwb5p-lrd14          # custom image recipe
-```
-
-Image outputs (deploy dir):
-```
-tmp/deploy/images/imx8mpevk/lwb5p-lrd14-imx8mpevk.rootfs.wic.gz
-```
-
-### 9.1 On-target (manual fallback) — verify the DT fix
-At the U-Boot prompt you can load the SDIO M.2 dtb manually to prove the fix:
-
-```
-setenv fdtfile imx8mp-evk-usdhc1-m2.dtb
-saveenv
-boot
-```
-
-(Add the same file to the FAT boot partition if you only want to test and not bake.)
-
----
-
-## 10. Verification on Target
-
-```bash
-# WiFi (SDIO)
-iw dev                  # expect: phy0 / wlan0
-ip link set wlan0 up
-iw dev wlan0 scan | head
-
-# Bluetooth (UART)
-hciconfig -a            # expect: hci0 UP RUNNING
-bluetoothctl            # interactive pairing/scan
-dmesg | grep -iE 'brcm|hci_uart|hci0'
-```
-
-Kernel log should show the Broadcom HCI binding and loading of the LWB5+ HCD firmware,
-e.g. `BCM4373A0-sdio*…hcd`.
-
----
-
-## 11. Open Issues / Notes
-
-- ~~Compiler API mismatch (kernel 6.12 vs backports 14.8.0.6).~~
-  **Resolved.** Earlier builds set `CONFIG_CFG80211 is not set`, which compiled
-  `net_device.ieee80211_ptr` out of kernel 6.12 and broke the backports WLAN build
-  (`nl80211.c: no member 'ieee80211_ptr'`), aborting the whole recipe before the
-  Bluetooth modules could be packaged. The fix is to set **`CONFIG_CFG80211=m`**
-  (a module keeps the member in the kernel and does not trip `checks.h`), leaving
-  `MAC80211`/`BT`/`WLAN` off so Summit's backports provide them. With that, both
-  `brcmfmac`/`cfg80211` (wlan0) and `hci_uart`/`btbcm`/`bluetooth` (hci0) build
-  successfully on kernel 6.12.34.
-
-- **EEPROM/reg files** are installed via the firmware packages
-  (`regLWB5plus-aarch64` etc.) and picked up at runtime.
-
-- **M.2 vs USB preference.** This guide uses the M.2 **SDIO/UART** module, not the USB
-  dongle. (The USB path can additionally suffer from power/enumeration issues on
-  `usb@38100000`.)
-
----
-
-## 12. Related Files (in this BSP)
+### Files created (summary)
 
 | File | Purpose |
 |------|---------|
-| `recipes-kernel/linux/files/dts/imx8mp-evk-lwb5plus.dts` | custom DT (SDIO wifi + BT) |
+| `recipes-kernel/linux/files/dts/imx8mp-evk-lwb5plus.dts` | custom DT: SDIO wifi + BT on uart1 |
 | `recipes-kernel/linux/linux-imx_%.bbappend` | build dtb, patch defconfig |
 | `recipes-bsp/u-boot/u-boot-imx_%.bbappend` | boot custom dtb by default |
 | `recipes-bsp/u-boot/files/imx8mpevk-lwb5plus.cfg` | `CONFIG_DEFAULT_FDT_FILE` |
-| `recipes-packages/images/lwb5p-lrd14.bb` | custom image recipe (SDIO variant) |
+| `recipes-packages/images/lwb5p-lrd14.bb` | custom image recipe |
+
+### Architecture
+
+```
+                    i.MX8M Plus EVK
+  ┌───────────────────────────────────────────────┐
+  │  M.2 slot ── SDIO ──► usdhc1 (mmc@30b40000)  │  WLAN (wlan0)
+  │      └────── UART ──► uart1                   │  BT (hci0)
+  │  SD card   ── SDIO ──► usdhc2 (mmc@30b50000) │  boot device (mmcblk1)
+  │  eMMC      ── SDIO ──► usdhc3 (mmc@30b60000) │  non-removable
+  └───────────────────────────────────────────────┘
+```
+
+### Reference documents
+
+- Ezurio USB-dongle app note (original): <https://www.ezurio.com/documentation/application-note-sterling-lwb5-usb-dongle-nxp-i-m8x-evk-integration-guide>
+- Ezurio `meta-summit-radio` (`lrd-14.8.0.x`): <https://github.com/Ezurio/meta-summit-radio>
+- NXP i.MX8MP EVK device trees in `linux-imx`: `imx8mp-evk.dts`, `imx8mp-evk-usdhc1-m2.dts`
 
 ---
 
-[appnote-usb]: https://www.ezurio.com/documentation/application-note-sterling-lwb5-usb-dongle-nxp-i-m8x-evk-integration-guide
+## Troubleshooting
+
+- **Build fails: `struct net_device has no member named 'ieee80211_ptr'`** → the kernel was
+  built with `CONFIG_CFG80211 is not set`. Re-check Part D.2: it must be `CONFIG_CFG80211=m`.
+- **`hciconfig` shows nothing** → confirm the backports built its BT modules
+  (`hci_uart.ko`, `btbcm.ko` in the image), and that the custom dtb is active
+  (`dmesg | grep -i bluetooth`). If `usdhc1` is still disabled in the boot dtb, WLAN won't
+  come up either.
+- **Wrong device tree at boot** → confirm `CONFIG_DEFAULT_FDT_FILE` (Part D.3) took effect;
+  temporarily, at the U-Boot prompt: `setenv fdtfile imx8mp-evk-lwb5plus.dtb; saveenv; boot`.
