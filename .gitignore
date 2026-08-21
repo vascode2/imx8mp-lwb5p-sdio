@@ -1,0 +1,19 @@
+# Build & cache
+build-*/
+downloads/
+cache/
+sstate-cache/
+
+# repo tool
+.repo/
+
+# repo-managed BSP sources (each is its own git repo from imx-setup-release.sh)
+sources/
+
+# stray kernel .config / local artifacts
+.config
+
+# editors / OS
+*.swp
+*.swo
+.DS_Store
