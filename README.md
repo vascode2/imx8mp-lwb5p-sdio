@@ -8,6 +8,9 @@ This guide takes you from **nothing** to a bootable Yocto image for the NXP
 
 Everything is a copy-paste block. Run each block top-to-bottom in the order shown.
 
+> For the full technical design and background (device tree details, layer changes,
+> architecture), see [`IMX8MP_LWB5_SDIO_UART_INTEGRATION.md`](IMX8MP_LWB5_SDIO_UART_INTEGRATION.md).
+
 > **Bottom line:** we use **Ezurio/Summit's own wireless & Bluetooth stack** (the
 > `meta-summit-radio` backports), not the mainline kernel drivers. That is why we
 > disable the kernel's built-in wireless/BT and set `CONFIG_CFG80211=m` (a module,
